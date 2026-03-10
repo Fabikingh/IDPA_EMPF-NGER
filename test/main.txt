@@ -1,0 +1,331 @@
+/*
+  IDPA Receiver (RX) — SoftAP UDP audio -> I2S (UDA1334A)
+  + Control output (rotary/inputs later) over UDP WITHOUT touching audio timing.
+
+  Audio packet format (from TX):
+    [0..3]  u32 seq (LE)
+    [4..5]  u16 MAGIC = 0xA55A (LE)
+    [6..7]  u16 flags/reserved
+    [8..]   PCM int16 stereo interleaved, FRAMES samples per channel
+
+  Key properties (unchanged):
+  - UDP receive decoupled from I2S write (two tasks).
+  - Ring buffer absorbs WiFi jitter.
+  - Start playback after prefill.
+  - Missing packets: last-sample hold (no zero-fill steps).
+  - DMA length matches FRAMES for seamless chunk writes.
+
+  Added:
+  - Separate UDP socket for Control (port 3335) to broadcast commands to TX + Display ESP.
+  - Separate low-priority uiTask() placeholder (does not block audio).
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "driver/i2s.h"
+
+// ===== SoftAP =====
+static const char* AP_SSID = "IDPA_AUDIO_RX1";
+static const char* AP_PASS = "12345678";
+static const uint16_t UDP_PORT = 3333;   // AUDIO port (unchanged)
+
+// Separate UDP sockets (safer separation)
+static constexpr uint16_t UDP_AUDIO_PORT = UDP_PORT;  // keep existing value
+static constexpr uint16_t UDP_CTL_PORT   = 3335;      // NEW: control port
+
+static const IPAddress BCAST_IP(192, 168, 4, 255);
+
+WiFiUDP udpAudio;
+WiFiUDP udpCtl;
+
+// ===== Audio =====
+static constexpr uint32_t FS = 48000;
+static constexpr int PACKET_MS = 5;
+static constexpr int FRAMES = (FS * PACKET_MS) / 1000;  // 240
+static constexpr int CH = 2;
+static constexpr uint16_t MAGIC = 0xA55A;
+
+static constexpr int SAMPLES_PER_PACKET = FRAMES * CH;  // 480 int16
+static constexpr int AUDIO_BYTES = SAMPLES_PER_PACKET * sizeof(int16_t); // 960 bytes
+static constexpr int PKT_BYTES = 8 + AUDIO_BYTES;       // 968 bytes
+
+// ===== I2S (UDA1334A) pins =====
+static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
+static constexpr gpio_num_t PIN_BCK  = GPIO_NUM_26;
+static constexpr gpio_num_t PIN_WS   = GPIO_NUM_25;
+static constexpr gpio_num_t PIN_DOUT = GPIO_NUM_22;
+
+// ===== Jitter buffer =====
+static constexpr int BUFFER_MS = 100;        // 100ms buffer (unchanged)
+static constexpr int PREFILL_MS = 50;        // start playback after 50ms buffered (unchanged)
+
+static constexpr int SAMPLES_PER_SEC = FS * CH; // 96000 int16/sec
+static constexpr int RING_SAMPLES = (SAMPLES_PER_SEC * BUFFER_MS) / 1000;
+
+// Ring buffer of int16 samples
+static int16_t ringBuf[RING_SAMPLES];
+static volatile uint32_t rb_w = 0;
+static volatile uint32_t rb_r = 0;
+static volatile uint32_t rb_fill = 0;
+
+// Stats
+static volatile uint32_t pk_ok=0, pk_bad=0, pk_magic=0, pk_drop=0, underflows=0;
+static volatile uint32_t last_seq=0;
+static volatile int32_t last_rssi=0;
+static volatile bool playback_started=false;
+
+// ===== Helpers =====
+static inline uint32_t rd_u32_le(const uint8_t* p){
+  return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static inline uint16_t rd_u16_le(const uint8_t* p){
+  return (uint16_t)p[0] | ((uint16_t)p[1]<<8);
+}
+
+// Drop oldest samples to make room (low-latency policy)
+static inline void rb_make_room(uint32_t need){
+  while (rb_fill + need > (uint32_t)RING_SAMPLES) {
+    uint32_t drop = (SAMPLES_PER_PACKET < rb_fill) ? SAMPLES_PER_PACKET : rb_fill;
+    rb_r = (rb_r + drop) % RING_SAMPLES;
+    rb_fill -= drop;
+    pk_drop++;
+  }
+}
+
+static inline void rb_push_samples(const int16_t* s, uint32_t n){
+  if (n == 0) return;
+  if (n > (uint32_t)RING_SAMPLES) {
+    // keep last RING_SAMPLES only
+    s += (n - RING_SAMPLES);
+    n = RING_SAMPLES;
+  }
+  rb_make_room(n);
+  for (uint32_t i=0;i<n;i++){
+    ringBuf[rb_w] = s[i];
+    rb_w = (rb_w + 1) % RING_SAMPLES;
+  }
+  rb_fill += n;
+}
+
+// Pop exactly n samples; if insufficient, hold last L/R samples (no zero-fill step)
+static inline void rb_pop_hold(int16_t* out, uint32_t n, int16_t &lastL, int16_t &lastR){
+  uint32_t got=0;
+  while (got < n && rb_fill > 0) {
+    out[got++] = ringBuf[rb_r];
+    rb_r = (rb_r + 1) % RING_SAMPLES;
+    rb_fill--;
+  }
+
+  // Update last sample pair if we got at least one full stereo frame
+  if (got >= 2) {
+    lastL = out[got - 2];
+    lastR = out[got - 1];
+  }
+
+  // Underflow padding: repeat last stereo frame
+  while (got < n) {
+    underflows++;
+    out[got++] = lastL;
+    out[got++] = lastR;
+  }
+}
+
+// ===== Control (NEW) =====
+#pragma pack(push,1)
+struct CtlPkt {
+  uint16_t magic;   // 0xC0DE
+  uint8_t  ver;     // 1
+  uint8_t  cmd;     // user-defined
+  int16_t  value;   // user-defined
+  uint32_t seq;     // increments
+};
+#pragma pack(pop)
+
+static constexpr uint16_t CTL_MAGIC = 0xC0DE;
+static volatile uint32_t ctl_seq = 1;
+
+// Non-blocking best-effort broadcast (tiny packets)
+static inline void sendCtl(uint8_t cmd, int16_t value){
+  CtlPkt p{};
+  p.magic = CTL_MAGIC;
+  p.ver   = 1;
+  p.cmd   = cmd;
+  p.value = value;
+  p.seq   = ctl_seq++;
+
+  udpCtl.beginPacket(BCAST_IP, UDP_CTL_PORT);
+  udpCtl.write((const uint8_t*)&p, sizeof(p));
+  udpCtl.endPacket();
+}
+
+// ===== WiFi/AP =====
+static void wifi_ap_start(){
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  delay(150);
+
+  udpAudio.begin(UDP_AUDIO_PORT);
+  udpCtl.begin(UDP_CTL_PORT);
+}
+
+// ===== Debug =====
+void debugTask(void*) {
+  for (;;) {
+    Serial.printf(
+      "[RX] ok=%lu bad=%lu magic=%lu drop=%lu under=%lu fill=%lu/%d start=%d RSSI=%ld last_seq=%lu\n",
+      (unsigned long)pk_ok,
+      (unsigned long)pk_bad,
+      (unsigned long)pk_magic,
+      (unsigned long)pk_drop,
+      (unsigned long)underflows,
+      (unsigned long)rb_fill,
+      (int)RING_SAMPLES,
+      playback_started ? 1 : 0,
+      (long)last_rssi,
+      (unsigned long)last_seq
+    );
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ===== I2S init =====
+static void i2s_tx_init(){
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = FS;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+
+  // Critical: match DMA len to FRAMES (your chunk size)
+  cfg.dma_buf_len = FRAMES;     // 240 (unchanged)
+  cfg.dma_buf_count = 10;
+  cfg.use_apll = true;
+  cfg.tx_desc_auto_clear = true;
+
+  ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &cfg, 0, nullptr));
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = PIN_BCK;
+  pins.ws_io_num  = PIN_WS;
+  pins.data_out_num = PIN_DOUT;
+  pins.data_in_num  = I2S_PIN_NO_CHANGE;
+#if ESP_IDF_VERSION_MAJOR >= 4
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
+#endif
+  ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pins));
+  ESP_ERROR_CHECK(i2s_set_clk(I2S_PORT, FS, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO));
+  i2s_zero_dma_buffer(I2S_PORT);
+}
+
+// ===== Tasks =====
+
+// AUDIO UDP receive (unchanged logic; just uses udpAudio)
+static void udpTask(void*){
+  static uint8_t buf[2048];
+
+  for(;;){
+    int psize = udpAudio.parsePacket();
+    if (psize <= 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+    if (psize > (int)sizeof(buf)) psize = sizeof(buf);
+
+    int n = udpAudio.read(buf, psize);
+    if (n == 5 && memcmp(buf, "HELLO", 5) == 0) continue;
+
+    if (n != PKT_BYTES) { pk_bad++; continue; }
+
+    uint16_t mg = rd_u16_le(&buf[4]);
+    if (mg != MAGIC) { pk_magic++; continue; }
+
+    uint32_t seq = rd_u32_le(&buf[0]);
+    last_seq = seq;
+
+    const int16_t* audio = (const int16_t*)(&buf[8]);
+    rb_push_samples(audio, SAMPLES_PER_PACKET);
+    pk_ok++;
+
+    // Note: RSSI in AP mode isn't per-station; keep it out of hot paths if it ever causes issues.
+    last_rssi = WiFi.RSSI();
+  }
+}
+
+// AUDIO playback task (unchanged)
+static void audioTask(void*){
+  static int16_t out[SAMPLES_PER_PACKET];
+  int16_t lastL=0, lastR=0;
+
+  const uint32_t prefill_samples = (SAMPLES_PER_SEC * PREFILL_MS) / 1000;
+
+  // Prefill before starting playback
+  for(;;){
+    if (rb_fill >= prefill_samples) { playback_started = true; break; }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+
+  for(;;){
+    rb_pop_hold(out, SAMPLES_PER_PACKET, lastL, lastR);
+
+    size_t written=0;
+    // This call is clock-driven: stable timebase (not packet-driven)
+    i2s_write(I2S_PORT, out, AUDIO_BYTES, &written, portMAX_DELAY);
+  }
+}
+
+// NEW: UI/Inputs task placeholder (low priority, never blocks audio)
+// Replace the placeholder logic with encoder/poti reads later.
+static void uiTask(void*){
+  // Example placeholders:
+  // cmd=1: volume/gain (0..1000), cmd=2: mode, cmd=3: hp cutoff, etc.
+  // Nothing is sent by default to avoid unintended changes.
+  for(;;){
+    // TODO: read inputs, debounce, detect changes, then call sendCtl(cmd, value)
+    // Example (disabled):
+    // sendCtl(1, 500);
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// Optional: listen for control packets too (e.g., ACK/status later).
+// Currently it just drains the socket so it never fills, without doing anything.
+static void ctlRxTask(void*){
+  static uint8_t buf[64];
+  for(;;){
+    int psize = udpCtl.parsePacket();
+    if (psize <= 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+    int n = udpCtl.read(buf, min(psize, (int)sizeof(buf)));
+    (void)n;
+    // TODO: parse ACK/status packets here if you want
+  }
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\n[RX] Stable UDP -> I2S with jitter buffer (Audio) + UDP Control (UI)");
+
+  wifi_ap_start();
+  i2s_tx_init();
+
+  // Pin tasks to different cores (kept same for audio tasks)
+  xTaskCreatePinnedToCore(udpTask,    "udpTask",    4096, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(audioTask,  "audioTask",  4096, nullptr, 3, nullptr, 0);
+
+  // NEW tasks (low impact)
+  xTaskCreatePinnedToCore(uiTask,     "uiTask",     4096, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(ctlRxTask,  "ctlRxTask",  3072, nullptr, 1, nullptr, 1);
+
+  xTaskCreatePinnedToCore(debugTask,  "debugTask",  3072, nullptr, 1, nullptr, 1);
+
+  Serial.printf("[RX] SoftAP %s IP=%s UDP_AUDIO=%u UDP_CTL=%u\n",
+                AP_SSID, WiFi.softAPIP().toString().c_str(),
+                (unsigned)UDP_AUDIO_PORT, (unsigned)UDP_CTL_PORT);
+}
+
+void loop(){
+  // nothing
+}
