@@ -5,9 +5,24 @@
 #include "driver/i2s.h"
 #include "idpa_protocol.h"
 
+static inline int32_t clampi32(int32_t v, int32_t lo, int32_t hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static inline int16_t clip16(int32_t v)
+{
+  if (v > 32767) return 32767;
+  if (v < -32768) return -32768;
+  return (int16_t)v;
+}
+
 // ================= NETWORK =================
 static WiFiUDP udpAudio;
 static WiFiUDP udpCmd;
+static WiFiUDP udpSensor;
 
 // ================= CONFIG =================
 static const char* AP_SSID = IDPA_SSID;
@@ -38,6 +53,20 @@ static volatile bool started = false;
 // Volume / channel mask
 static volatile int32_t g_gain_q8_8 = 1024; // 1.25x Default etwas niedriger gegen Stoerrauschen
 static volatile uint8_t g_ch_mask   = 0x03;
+
+// ================= FILTERED FFT EXPORT =================
+static constexpr int FFT_SIZE = 256;
+static constexpr int FFT_BINS = FFT_SIZE / 2;
+static constexpr uint32_t FFT_SEND_INTERVAL_MS = 80;
+
+static uint16_t fftFilteredLeftBins[FFT_BINS]  = {0};
+static uint16_t fftFilteredRightBins[FFT_BINS] = {0};
+static int16_t fftRingLeft[FFT_SIZE] = {0};
+static int16_t fftRingRight[FFT_SIZE] = {0};
+static volatile uint16_t fftRingHead = 0;
+static volatile bool fftFrameReady = false;
+static volatile uint32_t fftSeq = 1;
+static portMUX_TYPE fftMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ================= CMD =================
 #ifndef CMD_SET_VOLUME
@@ -104,6 +133,136 @@ static inline int16_t biquad_process(Biquad& f, int16_t x)
   if (y >  32767.0f) y =  32767.0f;
   if (y < -32768.0f) y = -32768.0f;
   return (int16_t)y;
+}
+
+static void fft_copy_frame(int16_t* leftOut, int16_t* rightOut)
+{
+  portENTER_CRITICAL(&fftMux);
+  const uint16_t head = fftRingHead;
+  for (int i = 0; i < FFT_SIZE; i++) {
+    const uint16_t idx = (uint16_t)((head + i) % FFT_SIZE);
+    leftOut[i] = fftRingLeft[idx];
+    rightOut[i] = fftRingRight[idx];
+  }
+  fftFrameReady = false;
+  portEXIT_CRITICAL(&fftMux);
+}
+
+static void fft_compute(const int16_t* samples, float* mags, uint16_t& peakBin)
+{
+  static float re[FFT_SIZE];
+  static float im[FFT_SIZE];
+  static float win[FFT_SIZE];
+  static bool winInit = false;
+
+  if (!winInit) {
+    for (int i = 0; i < FFT_SIZE; i++) {
+      win[i] = 0.5f * (1.0f - cosf((2.0f * PI * i) / (FFT_SIZE - 1)));
+    }
+    winInit = true;
+  }
+
+  for (int i = 0; i < FFT_SIZE; i++) {
+    re[i] = (float)samples[i] * win[i];
+    im[i] = 0.0f;
+  }
+
+  unsigned j = 0;
+  for (unsigned i = 1; i < FFT_SIZE; i++) {
+    unsigned bit = FFT_SIZE >> 1;
+    while (j & bit) {
+      j ^= bit;
+      bit >>= 1;
+    }
+    j ^= bit;
+    if (i < j) {
+      const float tr = re[i]; re[i] = re[j]; re[j] = tr;
+      const float ti = im[i]; im[i] = im[j]; im[j] = ti;
+    }
+  }
+
+  for (unsigned len = 2; len <= FFT_SIZE; len <<= 1) {
+    const float ang = -2.0f * PI / (float)len;
+    const float wlenCos = cosf(ang);
+    const float wlenSin = sinf(ang);
+
+    for (unsigned i = 0; i < FFT_SIZE; i += len) {
+      float wCos = 1.0f;
+      float wSin = 0.0f;
+      for (unsigned k = 0; k < len / 2; k++) {
+        const unsigned u = i + k;
+        const unsigned v = i + k + len / 2;
+
+        const float vr = re[v] * wCos - im[v] * wSin;
+        const float vi = re[v] * wSin + im[v] * wCos;
+
+        re[v] = re[u] - vr;
+        im[v] = im[u] - vi;
+        re[u] = re[u] + vr;
+        im[u] = im[u] + vi;
+
+        const float nextCos = wCos * wlenCos - wSin * wlenSin;
+        const float nextSin = wCos * wlenSin + wSin * wlenCos;
+        wCos = nextCos;
+        wSin = nextSin;
+      }
+    }
+  }
+
+  float maxMag = 0.0f;
+  peakBin = 0;
+  for (int i = 0; i < FFT_BINS; i++) {
+    const float m = sqrtf(re[i] * re[i] + im[i] * im[i]);
+    mags[i] = m;
+    if (i > 0 && m > maxMag) {
+      maxMag = m;
+      peakBin = (uint16_t)i;
+    }
+  }
+}
+
+static void fft_send_filtered_packet()
+{
+  static int16_t leftFrame[FFT_SIZE];
+  static int16_t rightFrame[FFT_SIZE];
+  static float magsL[FFT_BINS];
+  static float magsR[FFT_BINS];
+
+  fft_copy_frame(leftFrame, rightFrame);
+
+  uint16_t peakBinL = 0;
+  uint16_t peakBinR = 0;
+  fft_compute(leftFrame, magsL, peakBinL);
+  fft_compute(rightFrame, magsR, peakBinR);
+
+  float maxMag = 1.0f;
+  for (int i = 0; i < FFT_BINS; i++) {
+    if (magsL[i] > maxMag) maxMag = magsL[i];
+    if (magsR[i] > maxMag) maxMag = magsR[i];
+  }
+
+  for (int i = 0; i < FFT_BINS; i++) {
+    fftFilteredLeftBins[i]  = (uint16_t)((magsL[i] / maxMag) * 60000.0f);
+    fftFilteredRightBins[i] = (uint16_t)((magsR[i] / maxMag) * 60000.0f);
+  }
+
+  PiezoFftPacketV1 p{};
+  p.header.magic = PKT_MAGIC;
+  p.header.version = 1;
+  p.header.type = PKT_TYPE_PIEZO_FFT_FILTERED;
+  p.header.seq = fftSeq++;
+  p.header.t_ms = millis();
+  p.header.payload_len = sizeof(PiezoFftPacketV1) - sizeof(PacketHeaderV1);
+  p.binCount = FFT_BINS;
+  p.reserved = 0;
+  p.peakHzLeft = ((float)peakBinL * (float)FS) / (float)FFT_SIZE;
+  p.peakHzRight = ((float)peakBinR * (float)FS) / (float)FFT_SIZE;
+  memcpy(p.binsLeft, fftFilteredLeftBins, sizeof(fftFilteredLeftBins));
+  memcpy(p.binsRight, fftFilteredRightBins, sizeof(fftFilteredRightBins));
+
+  udpSensor.beginPacket(IP_DISPLAY, UDP_SENSOR_PORT);
+  udpSensor.write((const uint8_t*)&p, sizeof(p));
+  udpSensor.endPacket();
 }
 
 static void biquad_set_identity(Biquad& f)
@@ -414,8 +573,30 @@ static void audio_play_task(void*)
 
     process_audio_block(local);
 
+    int16_t* s = (int16_t*)local;
+    portENTER_CRITICAL(&fftMux);
+    for (int i = 0; i < FRAMES; i++) {
+      fftRingLeft[fftRingHead] = s[2 * i + 0];
+      fftRingRight[fftRingHead] = s[2 * i + 1];
+      fftRingHead = (uint16_t)((fftRingHead + 1) % FFT_SIZE);
+    }
+    fftFrameReady = true;
+    portEXIT_CRITICAL(&fftMux);
+
     size_t out = 0;
     i2s_write(I2S_PORT, local, AUDIO_BYTES, &out, portMAX_DELAY);
+  }
+}
+static void fft_task(void*)
+{
+  uint32_t lastSend = 0;
+  while (true) {
+    const uint32_t now = millis();
+    if (fftFrameReady && (now - lastSend >= FFT_SEND_INTERVAL_MS)) {
+      lastSend = now;
+      fft_send_filtered_packet();
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -433,6 +614,7 @@ void setup()
 
   udpAudio.begin(UDP_AUDIO_PORT);
   udpCmd.begin(UDP_CMD_PORT);
+  udpSensor.begin(UDP_SENSOR_PORT);
 
   i2s_config_t cfg{};
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
@@ -462,6 +644,7 @@ void setup()
   xTaskCreatePinnedToCore(audio_rx_task,   "audio_rx",   4096, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(audio_play_task, "audio_play", 4096, nullptr, 3, nullptr, 1);
   xTaskCreatePinnedToCore(cmd_task,        "cmd_task",   3072, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(fft_task,        "fft_task",   6144, nullptr, 1, nullptr, 0);
 }
 
 void loop()

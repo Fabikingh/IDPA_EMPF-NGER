@@ -17,11 +17,16 @@ static constexpr uint16_t UDP_AUDIO_PORT  = 3333;
 static constexpr uint16_t UDP_SENSOR_PORT = 5005;
 static constexpr uint16_t UDP_CMD_PORT    = 5006;
 
-// FFT data stream (Empfänger -> Display)
+// Legacy FFT data stream (Empfänger -> Display)
 static constexpr uint16_t UDP_FFT_PORT    = 4444;
 static constexpr uint16_t FFT_MAGIC       = 0xF17A;
 // maximum number of bins that can be included in stream
 static constexpr int      FFT_MAX_BINS    = 1024;
+
+// New piezo FFT streams
+static constexpr uint8_t  PKT_TYPE_PIEZO_FFT_RAW      = 0x12; // Sender -> Display
+static constexpr uint8_t  PKT_TYPE_PIEZO_FFT_FILTERED = 0x13; // Empfänger -> Display
+static constexpr uint16_t PIEZO_FFT_BINS_TX           = 128;
 
 #pragma pack(push, 1)
 
@@ -29,7 +34,7 @@ static constexpr int      FFT_MAX_BINS    = 1024;
 enum : uint16_t { PKT_MAGIC = 0xA55A };
 enum : uint8_t  { PKT_TYPE_IMU = 1, PKT_TYPE_ENV = 2, PKT_TYPE_USER = 3 };
 
-struct PktHeader {
+struct PacketHeaderV1 {
   uint16_t magic;       // 0xA55A
   uint8_t  version;     // 1
   uint8_t  type;        // PKT_TYPE_*
@@ -37,6 +42,8 @@ struct PktHeader {
   uint32_t t_ms;        // millis() am Sender
   uint16_t payload_len; // bytes nach header
 };
+
+using PktHeader = PacketHeaderV1;
 
 struct PayloadIMUv1 {
   uint8_t  espId;
@@ -46,8 +53,19 @@ struct PayloadIMUv1 {
 };
 
 struct SensorPacketV1 {
-  PktHeader header;
+  PacketHeaderV1 header;
   PayloadIMUv1 imu;     // type=PKT_TYPE_IMU
+};
+
+// ---------------- Piezo FFT (Sender/Empfänger -> Display) ----------------
+struct PiezoFftPacketV1 {
+  PacketHeaderV1 header;
+  uint16_t binCount;
+  uint16_t reserved;
+  float    peakHzLeft;
+  float    peakHzRight;
+  uint16_t binsLeft[PIEZO_FFT_BINS_TX];
+  uint16_t binsRight[PIEZO_FFT_BINS_TX];
 };
 
 // ---------------- Commands (Display -> Empfänger) ----------------
@@ -68,7 +86,7 @@ struct CmdPacketV1 {
 // PCM: int16 stereo interleaved
 static constexpr uint16_t AUDIO_MAGIC = 0xA55A;
 
-// ---------------- FFT (Empfänger -> Display) ----------------
+// ---------------- Legacy FFT (Empfänger -> Display) ----------------
 #pragma pack(push, 1)
 struct FftPacket {
   uint16_t magic;       // FFT_MAGIC
